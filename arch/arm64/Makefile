@@ -72,18 +72,6 @@ ifeq ($(CONFIG_COMPAT_VDSO), y)
   endif
 endif
 
-ifeq ($(cc-name),clang)
-KBUILD_CFLAGS	+= -mllvm -polly \
-					-mllvm -polly-run-dce \
-					-mllvm -polly-run-inliner \
-					-mllvm -polly-opt-fusion=max \
-					-mllvm -polly-ast-use-context \
-					-mllvm -polly-vectorizer=stripmine \
-					-mllvm -polly-detect-keep-going
-
-KBUILD_CFLAGS	+= -O3
-endif
-
 KBUILD_CFLAGS	+= $(lseinstr) $(vdso32)
 KBUILD_CFLAGS	+= -mgeneral-regs-only
 KBUILD_CFLAGS	+= -fno-pic
