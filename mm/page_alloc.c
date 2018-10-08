@@ -63,6 +63,7 @@
 #include <linux/page_owner.h>
 #include <linux/kthread.h>
 #include <linux/random.h>
+#include <linux/simple_lmk.h>
 
 #include <asm/sections.h>
 #include <asm/tlbflush.h>
@@ -118,6 +119,22 @@ unsigned long totalcma_pages __read_mostly;
 
 int percpu_pagelist_fraction;
 gfp_t gfp_allowed_mask __read_mostly = GFP_BOOT_MASK;
+
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+struct page_alloc_req {
+	gfp_t gfp_mask;
+	unsigned int order;
+	int alloc_flags;
+	struct alloc_context *ac;
+	struct list_head list;
+	struct page *new_page;
+	struct completion *alloc_done;
+};
+
+static LIST_HEAD(oom_reqs_queue);
+static DEFINE_SPINLOCK(oom_queue_lock);
+static atomic_t simple_lmk_refcnt = ATOMIC_INIT(0);
+#endif
 
 /*
  * A cached value of the page's pageblock's migratetype, used when the page is
@@ -2752,6 +2769,11 @@ try_this_zone:
 		page = buffered_rmqueue(ac->preferred_zone, zone, order,
 				gfp_mask, alloc_flags, ac->migratetype);
 		if (page) {
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+			if (page->reserved_for_lmk && !ac->is_lmk_alloc)
+				goto try_this_zone;
+#endif
+
 			if (prep_new_page(page, order, gfp_mask, alloc_flags))
 				goto try_this_zone;
 
@@ -3138,6 +3160,77 @@ static inline bool is_thp_gfp_mask(gfp_t gfp_mask)
 	return (gfp_mask & (GFP_TRANSHUGE | __GFP_KSWAPD_RECLAIM)) == GFP_TRANSHUGE;
 }
 
+/*
+ * Maximum number of reclaim retries without any progress before OOM killer
+ * is consider as the only way to move forward.
+ */
+#define MAX_RECLAIM_RETRIES 16
+
+/*
+ * Checks whether it makes sense to retry the reclaim to make a forward progress
+ * for the given allocation request.
+ * The reclaim feedback represented by did_some_progress (any progress during
+ * the last reclaim round), pages_reclaimed (cumulative number of reclaimed
+ * pages) and no_progress_loops (number of reclaim rounds without any progress
+ * in a row) is considered as well as the reclaimable pages on the applicable
+ * zone list (with a backoff mechanism which is a function of no_progress_loops).
+ *
+ * Returns true if a retry is viable or false to enter the oom path.
+ */
+static inline bool
+should_reclaim_retry(gfp_t gfp_mask, unsigned order,
+		     struct alloc_context *ac, int alloc_flags,
+		     bool did_some_progress, unsigned long pages_reclaimed,
+		     int no_progress_loops)
+{
+	struct zone *zone;
+	struct zoneref *z;
+
+	/*
+	 * Make sure we converge to OOM if we cannot make any progress
+	 * several times in the row.
+	 */
+	if (no_progress_loops > MAX_RECLAIM_RETRIES)
+		return false;
+
+	if (order > PAGE_ALLOC_COSTLY_ORDER) {
+		if (pages_reclaimed >= (1<<order))
+			return false;
+
+		if (did_some_progress)
+			return true;
+	}
+
+	/*
+	 * Keep reclaiming pages while there is a chance this will lead somewhere.
+	 * If none of the target zones can satisfy our allocation request even
+	 * if all reclaimable pages are considered then we are screwed and have
+	 * to go OOM.
+	 */
+	for_each_zone_zonelist_nodemask(zone, z, ac->zonelist, ac->high_zoneidx,
+					ac->nodemask) {
+		unsigned long available;
+
+		available = zone_reclaimable_pages(zone);
+		available -= DIV_ROUND_UP(no_progress_loops * available,
+					  MAX_RECLAIM_RETRIES);
+		available += zone_page_state_snapshot(zone, NR_FREE_PAGES);
+
+		/*
+		 * Would the allocation succeed if we reclaimed the whole
+		 * available?
+		 */
+		if (__zone_watermark_ok(zone, order, min_wmark_pages(zone),
+				ac->high_zoneidx, alloc_flags, available)) {
+			/* Wait for some write requests to complete then retry */
+			wait_iff_congested(zone, BLK_RW_ASYNC, HZ/50);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static inline struct page *
 __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 						struct alloc_context *ac)
@@ -3150,6 +3243,12 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	enum migrate_mode migration_mode = MIGRATE_ASYNC;
 	bool deferred_compaction = false;
 	int contended_compaction = COMPACT_CONTENDED_NONE;
+	int no_progress_loops = 0;
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+	DECLARE_COMPLETION_ONSTACK(alloc_done);
+	struct page_alloc_req pg_req;
+	unsigned long flags;
+#endif
 
 	/*
 	 * In the slowpath, we sanity check order to avoid ever trying to
@@ -3289,6 +3388,48 @@ retry:
 	if (!is_thp_gfp_mask(gfp_mask) || (current->flags & PF_KTHREAD))
 		migration_mode = MIGRATE_SYNC_LIGHT;
 
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+	if (gfp_mask & __GFP_NORETRY)
+		goto noretry;
+
+	ac->is_lmk_alloc = true;
+	pg_req.gfp_mask = gfp_mask;
+	pg_req.order = order;
+	pg_req.alloc_flags = alloc_flags | ALLOC_NO_WATERMARKS;
+	pg_req.ac = ac;
+	pg_req.new_page = NULL;
+	pg_req.alloc_done = &alloc_done;
+
+	spin_lock_irqsave(&oom_queue_lock, flags);
+	list_add_tail(&pg_req.list, &oom_reqs_queue);
+	spin_unlock_irqrestore(&oom_queue_lock, flags);
+
+	atomic_inc(&simple_lmk_refcnt);
+
+	/* Keep performing memory reclaim until we get our memory */
+	while (1) {
+		long ret;
+
+		simple_lmk_force_reclaim();
+		ret = wait_for_completion_killable_timeout(&alloc_done,
+							LMK_OOM_TIMEOUT);
+		if (ret) {
+			if (ret == -ERESTARTSYS) {
+				/* Give up since this process is dying */
+				spin_lock_irqsave(&oom_queue_lock, flags);
+				if (!pg_req.new_page)
+					list_del(&pg_req.list);
+				spin_unlock_irqrestore(&oom_queue_lock, flags);
+			}
+			break;
+		}
+	}
+
+	atomic_dec(&simple_lmk_refcnt);
+	page = pg_req.new_page;
+	goto got_pg;
+#endif
+
 	/* Try direct reclaim and then allocating */
 	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
 							&did_some_progress);
@@ -3299,14 +3440,24 @@ retry:
 	if (gfp_mask & __GFP_NORETRY)
 		goto noretry;
 
-	/* Keep reclaiming pages as long as there is reasonable progress */
-	pages_reclaimed += did_some_progress;
-	if ((did_some_progress && order <= PAGE_ALLOC_COSTLY_ORDER) ||
-	    ((gfp_mask & __GFP_REPEAT) && pages_reclaimed < (1 << order))) {
-		/* Wait for some write requests to complete then retry */
-		wait_iff_congested(ac->preferred_zone, BLK_RW_ASYNC, HZ/50);
-		goto retry;
+	/*
+	 * Do not retry costly high order allocations unless they are
+	 * __GFP_REPEAT
+	 */
+	if (order > PAGE_ALLOC_COSTLY_ORDER && !(gfp_mask & __GFP_REPEAT))
+		goto noretry;
+
+	if (did_some_progress) {
+		no_progress_loops = 0;
+		pages_reclaimed += did_some_progress;
+	} else {
+		no_progress_loops++;
 	}
+
+	if (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,
+				 did_some_progress > 0, pages_reclaimed,
+				 no_progress_loops))
+		goto retry;
 
 	/* Reclaim has failed us, start killing things */
 	page = __alloc_pages_may_oom(gfp_mask, order, ac, &did_some_progress);
@@ -3314,8 +3465,10 @@ retry:
 		goto got_pg;
 
 	/* Retry as long as the OOM killer is making progress */
-	if (did_some_progress)
+	if (did_some_progress) {
+		no_progress_loops = 0;
 		goto retry;
+	}
 
 noretry:
 	/*
@@ -3450,13 +3603,53 @@ unsigned long get_zeroed_page(gfp_t gfp_mask)
 }
 EXPORT_SYMBOL(get_zeroed_page);
 
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+static void simple_lmk_fulfill_reqs(void)
+{
+	struct page_alloc_req *pg_req, *tmp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&oom_queue_lock, flags);
+	list_for_each_entry_safe(pg_req, tmp, &oom_reqs_queue, list) {
+		struct page *new_page;
+
+		new_page = get_page_from_freelist(pg_req->gfp_mask,
+							pg_req->order,
+							pg_req->alloc_flags,
+							pg_req->ac);
+		if (!new_page)
+			continue;
+
+		pg_req->new_page = new_page;
+		list_del(&pg_req->list);
+		complete(pg_req->alloc_done);
+	}
+	spin_unlock_irqrestore(&oom_queue_lock, flags);
+}
+#endif
+
 void __free_pages(struct page *page, unsigned int order)
 {
 	if (put_page_testzero(page)) {
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+		bool is_system_oom = atomic_read(&simple_lmk_refcnt);
+
+		/* Reserve this page to see if it'll fulfill an OOM'd request */
+		if (is_system_oom)
+			page->reserved_for_lmk = true;
+#endif
+
 		if (order == 0)
 			free_hot_cold_page(page, false);
 		else
 			__free_pages_ok(page, order);
+
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+		if (is_system_oom) {
+			simple_lmk_fulfill_reqs();
+			page->reserved_for_lmk = false;
+		}
+#endif
 	}
 }
 
@@ -6143,49 +6336,6 @@ void setup_per_zone_wmarks(void)
 }
 
 /*
- * The inactive anon list should be small enough that the VM never has to
- * do too much work, but large enough that each inactive page has a chance
- * to be referenced again before it is swapped out.
- *
- * The inactive_anon ratio is the target ratio of ACTIVE_ANON to
- * INACTIVE_ANON pages on this zone's LRU, maintained by the
- * pageout code. A zone->inactive_ratio of 3 means 3:1 or 25% of
- * the anonymous pages are kept on the inactive list.
- *
- * total     target    max
- * memory    ratio     inactive anon
- * -------------------------------------
- *   10MB       1         5MB
- *  100MB       1        50MB
- *    1GB       3       250MB
- *   10GB      10       0.9GB
- *  100GB      31         3GB
- *    1TB     101        10GB
- *   10TB     320        32GB
- */
-static void __meminit calculate_zone_inactive_ratio(struct zone *zone)
-{
-	unsigned int gb, ratio;
-
-	/* Zone size in gigabytes */
-	gb = zone->managed_pages >> (30 - PAGE_SHIFT);
-	if (gb)
-		ratio = int_sqrt(10 * gb);
-	else
-		ratio = 1;
-
-	zone->inactive_ratio = ratio;
-}
-
-static void __meminit setup_per_zone_inactive_ratio(void)
-{
-	struct zone *zone;
-
-	for_each_zone(zone)
-		calculate_zone_inactive_ratio(zone);
-}
-
-/*
  * Initialise min_free_kbytes.
  *
  * For small machines we want it small (128k min).  For large machines
@@ -6230,7 +6380,6 @@ int __meminit init_per_zone_wmark_min(void)
 	setup_per_zone_wmarks();
 	refresh_zone_stat_thresholds();
 	setup_per_zone_lowmem_reserve();
-	setup_per_zone_inactive_ratio();
 	return 0;
 }
 core_initcall(init_per_zone_wmark_min)

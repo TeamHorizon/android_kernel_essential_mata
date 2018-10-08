@@ -130,6 +130,8 @@ extern int isolate_lru_page(struct page *page);
 extern void putback_lru_page(struct page *page);
 extern bool zone_reclaimable(struct zone *zone);
 
+#define lru_to_page(_head) (list_entry((_head)->prev, struct page, lru))
+
 /*
  * in mm/rmap.c:
  */
@@ -160,6 +162,9 @@ struct alloc_context {
 	int migratetype;
 	enum zone_type high_zoneidx;
 	bool spread_dirty_pages;
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+	bool is_lmk_alloc;
+#endif
 };
 
 /*
